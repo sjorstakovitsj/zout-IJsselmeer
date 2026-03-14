@@ -1,0 +1,5 @@
+pyproj
+streamlit>=1.55.0
+plotly>=5.0
+pandas>=2.0
+

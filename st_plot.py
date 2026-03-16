@@ -6,7 +6,8 @@ from pyproj import Transformer
 
 SINGLE_CSV_PATH = './data/chloridemetingen ijsselmeer.csv'
 
-def load_single_csv():
+
+def load_single_csv() -> pd.DataFrame:
     df = pd.read_csv(SINGLE_CSV_PATH)
     df['Datumtijd'] = pd.to_datetime(df['Datumtijd'], errors='coerce')
     df['Datum'] = df['Datumtijd'].dt.normalize()
@@ -26,14 +27,16 @@ def load_single_csv():
 
     return df
 
-def build_summary_tables(df):
+
+def build_summary_tables(df: pd.DataFrame):
     agg_common = {
         'x-coordinaat (RD)': 'mean',
         'y-coordinaat (RD)': 'mean',
         'Chloriniteit (mg/l)': 'mean',
         'Datumtijd': 'first',
-        'filename': 'first' if 'filename' in df.columns else 'first',
     }
+    if 'filename' in df.columns:
+        agg_common['filename'] = 'first'
 
     df_gemiddeld = df.groupby('sheet').agg(agg_common).reset_index()
 
@@ -41,26 +44,37 @@ def build_summary_tables(df):
     agg_max['Chloriniteit (mg/l)'] = 'max'
     df_maximaal = df.groupby('sheet').agg(agg_max).reset_index()
 
-    return df_gemiddeld, df_maximaal
+    agg_min = agg_common.copy()
+    agg_min['Chloriniteit (mg/l)'] = 'min'
+    df_minimaal = df.groupby('sheet').agg(agg_min).reset_index()
 
-def add_coordinates(df):
+    return df_gemiddeld, df_minimaal, df_maximaal
+
+
+def add_coordinates(df: pd.DataFrame) -> pd.DataFrame:
     transformer = Transformer.from_crs('EPSG:28992', 'EPSG:4326', always_xy=True)
     lons, lats = transformer.transform(df['x-coordinaat (RD)'].values, df['y-coordinaat (RD)'].values)
+    df = df.copy()
     df['lon'] = lons
     df['lat'] = lats
     return df
 
-def add_labels_and_hover(df):
+
+def add_labels_and_hover(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df['label_text'] = df['Chloriniteit (mg/l)'].round(1).astype(str)
-    bestandsnaam = df['filename'].fillna('') if 'filename' in df.columns else ''
+    bestandsnaam = df['filename'].fillna('') if 'filename' in df.columns else pd.Series([''] * len(df), index=df.index)
+    datumtekst = pd.to_datetime(df['Datumtijd'], errors='coerce').dt.strftime('%d-%m-%Y %H:%M:%S').fillna('')
+
     df['hover_text'] = (
-        'Bestandsnaam: ' + bestandsnaam.astype(str) + '<br>' +
-        'Datumtijd: ' + df['Datumtijd'].dt.strftime('%d-%m-%Y %H:%M:%S') + '<br>' +
-        'Chloriniteit: ' + df['Chloriniteit (mg/l)'].round(2).astype(str) + ' mg/L'
+        'Bestandsnaam: ' + bestandsnaam.astype(str)
+        + '<br>Datumtijd: ' + datumtekst
+        + '<br>Chloriniteit: ' + df['Chloriniteit (mg/l)'].round(2).astype(str) + ' mg/L'
     )
     return df
 
-def create_map(df, title):
+
+def create_map(df: pd.DataFrame, title: str):
     fig = px.scatter_map(
         df,
         lat='lat',
@@ -81,7 +95,6 @@ def create_map(df, title):
         title=title,
         labels={'Chloriniteit (mg/l)': 'Chloriniteit (mg/L)'},
     )
-
     fig.update_traces(
         marker=dict(size=12),
         textposition='top center',
@@ -92,30 +105,50 @@ def create_map(df, title):
     fig.update_layout(height=800)
     return fig
 
+
 st.title('Kaartvisualisatie chloride IJsselmeer')
 
 df = load_single_csv()
 datums = sorted(df['Datum'].dropna().unique())
 
+if not datums:
+    st.warning('Geen geldige meetdatums gevonden in het bestand.')
+    st.stop()
+
+# Default altijd de meest recente datum
 gekozen_datum = st.selectbox(
     'Kies een meetdatum',
     datums,
-    format_func=lambda d: pd.Timestamp(d).strftime('%d-%m-%Y')
+    index=len(datums) - 1,
+    format_func=lambda d: pd.Timestamp(d).strftime('%d-%m-%Y'),
 )
 
+# Default altijd gemiddelde chloriniteit; ook minimale toegevoegd
 samenvatting_type = st.radio(
     'Kies kaarttype',
-    ['Gemiddelde', 'Maximale'],
-    horizontal=True
+    ['Gemiddelde', 'Minimale', 'Maximale'],
+    index=0,
+    horizontal=True,
 )
 
 df_dag = df[df['Datum'] == gekozen_datum].copy()
-df_gemiddeld, df_maximaal = build_summary_tables(df_dag)
+
+if df_dag.empty:
+    st.warning('Geen meetwaarden beschikbaar voor de geselecteerde datum.')
+    st.stop()
+
+df_gemiddeld, df_minimaal, df_maximaal = build_summary_tables(df_dag)
 
 if samenvatting_type == 'Gemiddelde':
     df_plot = df_gemiddeld
+elif samenvatting_type == 'Minimale':
+    df_plot = df_minimaal
 else:
     df_plot = df_maximaal
+
+if df_plot.empty:
+    st.warning('Geen samenvattingsdata beschikbaar voor de huidige selectie.')
+    st.stop()
 
 df_plot = add_coordinates(df_plot)
 df_plot = add_labels_and_hover(df_plot)

@@ -1,7 +1,7 @@
 import os
 import re
 import urllib.parse
-
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -10,12 +10,31 @@ from pyproj import Transformer
 st.set_page_config(layout='wide')
 
 SINGLE_CSV_PATH = './data/chloridemetingen ijsselmeer.csv'
-
 WMS_BASE_URL = 'https://geo.rijkswaterstaat.nl/services/ogc/gdr/bodemhoogte_ijsselmeergebied/ows'
 WMS_LAYER_NAME = 'bodemhoogte_ijg_2022'
 WMS_ATTRIBUTION = 'Rijkswaterstaat bathymetrie IJsselmeergebied'
-GREEN_THRESHOLD_MG_L = 150.0
 FIGURE_HEIGHT = 980
+KAARTTYPE_OPTIES = ['Gemiddelde', 'Minimale', 'Maximale', 'Max-min']
+
+# Duidelijker chloriniteitspalet met vaste drempels t/m 200 mg/L en
+# dynamische verdeling daarboven voor betere onderscheidbaarheid.
+CHLORINITY_BASE_BANDS = [
+    {'lower': None, 'upper': 100.0, 'color': '#006400', 'label': '< 100 mg/L'},       # donkergroen
+    {'lower': 100.0, 'upper': 150.0, 'color': '#008000', 'label': '100 - 150 mg/L'},  # groen
+    {'lower': 150.0, 'upper': 200.0, 'color': '#B8860B', 'label': '150 - 200 mg/L'},  # donkergeel
+]
+
+CHLORINITY_DYNAMIC_COLORS = [
+    ('#FFD700', 'vanaf 200 mg/L (geel)'),  # geel
+    ('#FF8C00', 'donkeroranje'),
+    ('#FFA500', 'oranje'),
+    ('#8B0000', 'donkerrood'),
+    ('#FF0000', 'rood'),
+    ('#4B0082', 'donkerpaars'),
+    ('#800080', 'paars'),
+    ('#654321', 'donkerbruin'),
+    ('#A52A2A', 'bruin'),
+]
 
 
 def parse_mixed_datetime(values):
@@ -24,7 +43,6 @@ def parse_mixed_datetime(values):
         series = values.copy()
     else:
         series = pd.Series(values)
-
     parsed = pd.to_datetime(series, format='mixed', errors='coerce')
     mask = parsed.isna()
     if mask.any():
@@ -44,26 +62,20 @@ def normalize_rd_coordinate_value(value):
     """
     if pd.isna(value):
         return value
-
     text = str(value).strip()
     if text == '':
         return pd.NA
-
     if re.fullmatch(r'\d{7,}', text):
         text = text[:6]
-
     return text
 
 
 def parse_numeric_series(series, coordinate=False):
     if coordinate:
         series = series.apply(normalize_rd_coordinate_value)
-
-    cleaned = series.astype(str).str.replace(' ', '', regex=False).str.strip()
-
+    cleaned = series.astype(str).str.replace(' ', '', regex=False).str.strip()
     comma_no_dot_mask = cleaned.str.contains(',', na=False) & ~cleaned.str.contains('.', na=False)
     cleaned.loc[comma_no_dot_mask] = cleaned.loc[comma_no_dot_mask].str.replace(',', '.', regex=False)
-
     return pd.to_numeric(cleaned, errors='coerce')
 
 
@@ -96,47 +108,133 @@ def build_wms_legend_url():
     return f"{WMS_BASE_URL}?{urllib.parse.urlencode(params)}"
 
 
+def _format_tick_value(value: float) -> str:
+    if pd.isna(value):
+        return ''
+    rounded = round(float(value), 1)
+    if rounded.is_integer():
+        return str(int(rounded))
+    return f'{rounded:.1f}'
+
+
+def _build_step_colorscale(intervals, vmin: float, vmax: float):
+    """Maak een Plotly stepped colorscale op basis van intervallen."""
+    if not intervals:
+        return [(0.0, '#006400'), (1.0, '#006400')]
+
+    if vmax <= vmin:
+        color = intervals[0][2]
+        return [(0.0, color), (1.0, color)]
+
+    colorscale = []
+    for start, end, color in intervals:
+        if end <= start:
+            continue
+        start_frac = max(0.0, min(1.0, (start - vmin) / (vmax - vmin)))
+        end_frac = max(0.0, min(1.0, (end - vmin) / (vmax - vmin)))
+        if not colorscale:
+            colorscale.append((start_frac, color))
+        elif colorscale[-1][0] != start_frac or colorscale[-1][1] != color:
+            colorscale.append((start_frac, color))
+        colorscale.append((end_frac, color))
+
+    if not colorscale:
+        return [(0.0, '#006400'), (1.0, '#006400')]
+
+    if colorscale[0][0] > 0.0:
+        colorscale.insert(0, (0.0, colorscale[0][1]))
+    if colorscale[-1][0] < 1.0:
+        colorscale.append((1.0, colorscale[-1][1]))
+    return colorscale
+
+
 def build_chlorinity_color_config(series: pd.Series):
-    """Maak een kleurschaal waarbij:
-    - waarden < 150 mg/l groen zijn;
-    - waarden vanaf 150 mg/l meteen geel starten;
-    - waarden boven 150 mg/l dynamisch autoschalen naar rood.
+    """Maak een onderscheidende chloriniteitsschaal.
+
+    Specificatie:
+    - < 100 mg/L: donkergroen
+    - 100 - 150 mg/L: groen
+    - 150 - 200 mg/L: donkergeel
+    - vanaf 200 mg/L: eerst geel, daarna dynamisch verdeeld over
+      donkeroranje, oranje, donkerrood, rood, donkerpaars, paars,
+      donkerbruin en bruin.
     """
     valid = pd.to_numeric(series, errors='coerce').dropna()
     if valid.empty:
-        return [(0.0, 'green'), (1.0, 'red')], None
+        fallback = [(0.0, '#006400'), (1.0, '#A52A2A')]
+        return fallback, None, None
 
     vmin = float(valid.min())
     vmax = float(valid.max())
 
     if vmax <= vmin:
-        if vmax < GREEN_THRESHOLD_MG_L:
-            return [(0.0, 'green'), (1.0, 'green')], [vmin, vmax]
-        return [(0.0, 'yellow'), (0.66, 'orange'), (1.0, 'red')], [vmin, vmax]
+        if vmin < 100.0:
+            color = '#006400'
+        elif vmin < 150.0:
+            color = '#008000'
+        elif vmin < 200.0:
+            color = '#B8860B'
+        else:
+            color = '#FFD700'
+        return [(0.0, color), (1.0, color)], [vmin, vmax], {
+            'tickmode': 'array',
+            'tickvals': [vmin],
+            'ticktext': [_format_tick_value(vmin)],
+        }
 
-    if vmax < GREEN_THRESHOLD_MG_L:
-        return [(0.0, 'green'), (1.0, 'green')], [vmin, vmax]
+    intervals = []
+    tick_values = [vmin, vmax]
 
-    if vmin >= GREEN_THRESHOLD_MG_L:
-        return [
-            (0.0, 'yellow'),
-            (0.66, 'orange'),
-            (1.0, 'red'),
-        ], [vmin, vmax]
+    for band in CHLORINITY_BASE_BANDS:
+        lower = vmin if band['lower'] is None else max(vmin, band['lower'])
+        upper_limit = band['upper'] if band['upper'] is not None else vmax
+        upper = min(vmax, upper_limit)
+        if upper > lower:
+            intervals.append((lower, upper, band['color']))
+            if band['upper'] is not None and vmin < band['upper'] < vmax:
+                tick_values.append(float(band['upper']))
 
-    threshold_fraction = (GREEN_THRESHOLD_MG_L - vmin) / (vmax - vmin)
-    threshold_fraction = min(max(threshold_fraction, 0.0), 1.0)
-    epsilon = min(1e-6, max(threshold_fraction / 1000.0, 1e-9))
-    green_stop = max(0.0, threshold_fraction - epsilon)
+    if vmax > 200.0:
+        dynamic_start = max(vmin, 200.0)
+        dynamic_count = len(CHLORINITY_DYNAMIC_COLORS)
+        dynamic_edges = np.linspace(dynamic_start, vmax, dynamic_count + 1)
+        for idx, (color, _label) in enumerate(CHLORINITY_DYNAMIC_COLORS):
+            start = float(dynamic_edges[idx])
+            end = float(dynamic_edges[idx + 1])
+            if end <= start:
+                continue
+            intervals.append((start, end, color))
+            if idx == 0 and start not in tick_values:
+                tick_values.append(start)
+            if idx < dynamic_count - 1:
+                tick_values.append(end)
+    elif vmin >= 200.0:
+        # Volledig dynamische schaal wanneer alle waarden >= 200 mg/L zijn.
+        dynamic_count = len(CHLORINITY_DYNAMIC_COLORS)
+        dynamic_edges = np.linspace(vmin, vmax, dynamic_count + 1)
+        for idx, (color, _label) in enumerate(CHLORINITY_DYNAMIC_COLORS):
+            start = float(dynamic_edges[idx])
+            end = float(dynamic_edges[idx + 1])
+            if end <= start:
+                continue
+            intervals.append((start, end, color))
+            if idx < dynamic_count - 1:
+                tick_values.append(end)
 
-    color_scale = [
-        (0.0, 'green'),
-        (green_stop, 'green'),
-        (threshold_fraction, 'yellow'),
-        (min(threshold_fraction + (1.0 - threshold_fraction) * 0.5, 1.0), 'orange'),
-        (1.0, 'red'),
-    ]
-    return color_scale, [vmin, vmax]
+    if not intervals:
+        color = '#006400'
+        intervals = [(vmin, vmax, color)]
+
+    colorscale = _build_step_colorscale(intervals, vmin, vmax)
+
+    tick_values = sorted({round(float(v), 6) for v in tick_values if vmin <= float(v) <= vmax})
+    colorbar_ticks = {
+        'tickmode': 'array',
+        'tickvals': tick_values,
+        'ticktext': [_format_tick_value(v) for v in tick_values],
+    }
+
+    return colorscale, [vmin, vmax], colorbar_ticks
 
 
 def load_single_csv() -> pd.DataFrame:
@@ -180,29 +278,54 @@ def build_summary_tables(df: pd.DataFrame):
     """Bouw samenvattingstabellen per meetlocatie voor één meetdag.
 
     Naast chloriniteit wordt ook de maximaal gemeten diepte meegenomen uit de
-    ruwe data van die dag en locatie.
+    ruwe data van die dag en locatie. Extra kaarttype 'Max-min' toont het
+    verschil tussen de maximale en minimale chloriniteit per meetlocatie.
     """
-    agg_common = {
+    agg_meta = {
         'x-coordinaat (RD)': 'mean',
         'y-coordinaat (RD)': 'mean',
-        'Chloriniteit (mg/l)': 'mean',
         'Diepte (m)': 'max',
         'Datumtijd': 'first',
     }
     if 'filename' in df.columns:
-        agg_common['filename'] = 'first'
+        agg_meta['filename'] = 'first'
 
-    df_gemiddeld = df.groupby('sheet', dropna=True).agg(agg_common).reset_index()
+    df_meta = df.groupby('sheet', dropna=True).agg(agg_meta).reset_index()
+    df_stats = (
+        df.groupby('sheet', dropna=True)['Chloriniteit (mg/l)']
+        .agg(['mean', 'min', 'max'])
+        .reset_index()
+    )
 
-    agg_max = agg_common.copy()
-    agg_max['Chloriniteit (mg/l)'] = 'max'
-    df_maximaal = df.groupby('sheet', dropna=True).agg(agg_max).reset_index()
+    df_gemiddeld = df_meta.merge(
+        df_stats[['sheet', 'mean']].rename(columns={'mean': 'Chloriniteit (mg/l)'}),
+        on='sheet',
+        how='left',
+    )
+    df_gemiddeld['waarde_label'] = 'Chloriniteit'
 
-    agg_min = agg_common.copy()
-    agg_min['Chloriniteit (mg/l)'] = 'min'
-    df_minimaal = df.groupby('sheet', dropna=True).agg(agg_min).reset_index()
+    df_minimaal = df_meta.merge(
+        df_stats[['sheet', 'min']].rename(columns={'min': 'Chloriniteit (mg/l)'}),
+        on='sheet',
+        how='left',
+    )
+    df_minimaal['waarde_label'] = 'Chloriniteit'
 
-    return df_gemiddeld, df_minimaal, df_maximaal
+    df_maximaal = df_meta.merge(
+        df_stats[['sheet', 'max']].rename(columns={'max': 'Chloriniteit (mg/l)'}),
+        on='sheet',
+        how='left',
+    )
+    df_maximaal['waarde_label'] = 'Chloriniteit'
+
+    df_max_min = df_meta.merge(
+        df_stats.assign(**{'Chloriniteit (mg/l)': df_stats['max'] - df_stats['min']})[['sheet', 'Chloriniteit (mg/l)']],
+        on='sheet',
+        how='left',
+    )
+    df_max_min['waarde_label'] = 'Max-min chloriniteit'
+
+    return df_gemiddeld, df_minimaal, df_maximaal, df_max_min
 
 
 def add_coordinates(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,12 +348,18 @@ def add_coordinates(df: pd.DataFrame) -> pd.DataFrame:
 def add_labels_and_hover(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df['label_text'] = df['Chloriniteit (mg/l)'].round(1).astype(str)
+
     bestandsnaam = (
         df['filename'].fillna('')
         if 'filename' in df.columns
         else pd.Series([''] * len(df), index=df.index)
     )
     datumtekst = pd.to_datetime(df['Datumtijd'], errors='coerce').dt.strftime('%d-%m-%Y %H:%M:%S').fillna('')
+    waarde_label = (
+        df['waarde_label'].fillna('Chloriniteit')
+        if 'waarde_label' in df.columns
+        else pd.Series(['Chloriniteit'] * len(df), index=df.index)
+    )
 
     if 'Diepte (m)' in df.columns:
         diepte_numeric = pd.to_numeric(df['Diepte (m)'], errors='coerce')
@@ -239,26 +368,34 @@ def add_labels_and_hover(df: pd.DataFrame) -> pd.DataFrame:
     else:
         max_diepte_tekst = pd.Series([''] * len(df), index=df.index)
 
+    waarde_tekst = df['Chloriniteit (mg/l)'].round(2).astype(str)
     df['hover_text'] = (
         'Bestandsnaam: ' + bestandsnaam.astype(str)
         + '<br>Datumtijd: ' + datumtekst
-        + '<br>Chloriniteit: ' + df['Chloriniteit (mg/l)'].round(2).astype(str) + ' mg/L'
+        + '<br>' + waarde_label.astype(str) + ': ' + waarde_tekst + ' mg/L'
         + '<br>Maximaal gemeten diepte (m): ' + max_diepte_tekst.astype(str)
     )
     return df
 
 
 def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left'):
-    color_scale, range_color = build_chlorinity_color_config(df['Chloriniteit (mg/l)'])
+    color_scale, range_color, colorbar_ticks = build_chlorinity_color_config(df['Chloriniteit (mg/l)'])
+    waarde_label = 'Chloriniteit'
+    if 'waarde_label' in df.columns and not df['waarde_label'].dropna().empty:
+        waarde_label = str(df['waarde_label'].dropna().iloc[0])
+    colorbar_title = f'{waarde_label} (mg/L)'
 
     colorbar_config = {
-        'title': 'Chloriniteit (mg/L)',
+        'title': colorbar_title,
         'y': 0.5,
         'yanchor': 'middle',
         'len': 0.88,
         'thickness': 22,
         'outlinewidth': 1,
     }
+    if colorbar_ticks:
+        colorbar_config.update(colorbar_ticks)
+
     if colorbar_side == 'right':
         colorbar_config.update({'x': 1.06, 'xanchor': 'left'})
         margin = {'l': 20, 'r': 90, 't': 60, 'b': 10}
@@ -278,6 +415,7 @@ def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left'):
             'Chloriniteit (mg/l)': False,
             'hover_text': True,
             'label_text': False,
+            'waarde_label': False,
         },
         color_continuous_scale=color_scale,
         range_color=range_color,
@@ -285,7 +423,7 @@ def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left'):
         center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
         map_style='white-bg',
         title=title,
-        labels={'Chloriniteit (mg/l)': 'Chloriniteit (mg/L)'},
+        labels={'Chloriniteit (mg/l)': colorbar_title},
     )
 
     fig.update_layout(
@@ -301,7 +439,6 @@ def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left'):
         margin=margin,
         coloraxis_colorbar=colorbar_config,
     )
-
     fig.update_traces(
         marker=dict(size=12),
         textposition='top center',
@@ -317,13 +454,15 @@ def build_plot_dataframe(df_day: pd.DataFrame, samenvatting_type: str) -> pd.Dat
     if df_day.empty:
         return pd.DataFrame()
 
-    df_gemiddeld, df_minimaal, df_maximaal = build_summary_tables(df_day)
+    df_gemiddeld, df_minimaal, df_maximaal, df_max_min = build_summary_tables(df_day)
     if samenvatting_type == 'Gemiddelde':
         df_plot = df_gemiddeld
     elif samenvatting_type == 'Minimale':
         df_plot = df_minimaal
-    else:
+    elif samenvatting_type == 'Maximale':
         df_plot = df_maximaal
+    else:
+        df_plot = df_max_min
 
     if df_plot.empty:
         return pd.DataFrame()
@@ -356,7 +495,6 @@ gekozen_jaar = st.selectbox(
 
 df_jaar = df[df['Jaar'] == gekozen_jaar].copy()
 datums = sorted(df_jaar['Datum'].dropna().unique())
-
 if not datums:
     st.warning('Geen geldige meetdatums gevonden voor het geselecteerde jaar.')
     st.stop()
@@ -383,7 +521,7 @@ with left_col:
     )
     samenvatting_type_links = st.radio(
         'Kies kaarttype (links)',
-        ['Gemiddelde', 'Minimale', 'Maximale'],
+        KAARTTYPE_OPTIES,
         index=0,
         horizontal=True,
         key='kaarttype_links',
@@ -412,7 +550,7 @@ with right_col:
     )
     samenvatting_type_rechts = st.radio(
         'Kies kaarttype (rechts)',
-        ['Gemiddelde', 'Minimale', 'Maximale'],
+        KAARTTYPE_OPTIES,
         index=0,
         horizontal=True,
         key='kaarttype_rechts',

@@ -19,13 +19,12 @@ KAARTTYPE_OPTIES = ['Gemiddelde', 'Minimale', 'Maximale', 'Max-min']
 # Duidelijker chloriniteitspalet met vaste drempels t/m 200 mg/L en
 # dynamische verdeling daarboven voor betere onderscheidbaarheid.
 CHLORINITY_BASE_BANDS = [
-    {'lower': None, 'upper': 100.0, 'color': '#006400', 'label': '< 100 mg/L'},       # donkergroen
+    {'lower': None, 'upper': 100.0, 'color': '#006400', 'label': '< 100 mg/L'},  # donkergroen
     {'lower': 100.0, 'upper': 150.0, 'color': '#008000', 'label': '100 - 150 mg/L'},  # groen
     {'lower': 150.0, 'upper': 200.0, 'color': '#B8860B', 'label': '150 - 200 mg/L'},  # donkergeel
 ]
-
 CHLORINITY_DYNAMIC_COLORS = [
-    ('#FFD700', 'vanaf 200 mg/L (geel)'),  # geel
+    ('#FFD700', 'vanaf 200 mg/L (geel)'),
     ('#FF8C00', 'donkeroranje'),
     ('#FFA500', 'oranje'),
     ('#8B0000', 'donkerrood'),
@@ -143,7 +142,6 @@ def _build_step_colorscale(intervals, vmin: float, vmax: float):
     """Maak een Plotly stepped colorscale op basis van intervallen."""
     if not intervals:
         return [(0.0, '#006400'), (1.0, '#006400')]
-
     if vmax <= vmin:
         color = intervals[0][2]
         return [(0.0, color), (1.0, color)]
@@ -162,7 +160,6 @@ def _build_step_colorscale(intervals, vmin: float, vmax: float):
 
     if not colorscale:
         return [(0.0, '#006400'), (1.0, '#006400')]
-
     if colorscale[0][0] > 0.0:
         colorscale.insert(0, (0.0, colorscale[0][1]))
     if colorscale[-1][0] < 1.0:
@@ -171,16 +168,7 @@ def _build_step_colorscale(intervals, vmin: float, vmax: float):
 
 
 def build_chlorinity_color_config(series: pd.Series):
-    """Maak een onderscheidende chloriniteitsschaal.
-
-    Specificatie:
-    - < 100 mg/L: donkergroen
-    - 100 - 150 mg/L: groen
-    - 150 - 200 mg/L: donkergeel
-    - vanaf 200 mg/L: eerst geel, daarna dynamisch verdeeld over
-      donkeroranje, oranje, donkerrood, rood, donkerpaars, paars,
-      donkerbruin en bruin.
-    """
+    """Maak een onderscheidende chloriniteitsschaal."""
     valid = pd.to_numeric(series, errors='coerce').dropna()
     if valid.empty:
         fallback = [(0.0, '#006400'), (1.0, '#A52A2A')]
@@ -206,15 +194,14 @@ def build_chlorinity_color_config(series: pd.Series):
 
     intervals = []
     tick_values = [vmin, vmax]
-
     for band in CHLORINITY_BASE_BANDS:
         lower = vmin if band['lower'] is None else max(vmin, band['lower'])
         upper_limit = band['upper'] if band['upper'] is not None else vmax
         upper = min(vmax, upper_limit)
         if upper > lower:
             intervals.append((lower, upper, band['color']))
-            if band['upper'] is not None and vmin < band['upper'] < vmax:
-                tick_values.append(float(band['upper']))
+        if band['upper'] is not None and vmin < band['upper'] < vmax:
+            tick_values.append(float(band['upper']))
 
     if vmax > 200.0:
         dynamic_start = max(vmin, 200.0)
@@ -231,7 +218,6 @@ def build_chlorinity_color_config(series: pd.Series):
             if idx < dynamic_count - 1:
                 tick_values.append(end)
     elif vmin >= 200.0:
-        # Volledig dynamische schaal wanneer alle waarden >= 200 mg/L zijn.
         dynamic_count = len(CHLORINITY_DYNAMIC_COLORS)
         dynamic_edges = np.linspace(vmin, vmax, dynamic_count + 1)
         for idx, (color, _label) in enumerate(CHLORINITY_DYNAMIC_COLORS):
@@ -248,25 +234,38 @@ def build_chlorinity_color_config(series: pd.Series):
         intervals = [(vmin, vmax, color)]
 
     colorscale = _build_step_colorscale(intervals, vmin, vmax)
-
     tick_values = sorted({round(float(v), 6) for v in tick_values if vmin <= float(v) <= vmax})
     colorbar_ticks = {
         'tickmode': 'array',
         'tickvals': tick_values,
         'ticktext': [_format_tick_value(v) for v in tick_values],
     }
-
     return colorscale, [vmin, vmax], colorbar_ticks
+
+
+def build_shared_chlorinity_color_settings(*dfs: pd.DataFrame):
+    """Bepaal één gedeelde chloriniteitsschaal op basis van beide kaarten.
+
+    De scaling-logica blijft exact gelijk; alleen de invoer voor de dynamische
+    legenda wordt gecombineerd over beide kaartselecties.
+    """
+    series_parts = []
+    for df in dfs:
+        if df is None or df.empty or 'Chloriniteit (mg/l)' not in df.columns:
+            continue
+        series_parts.append(pd.to_numeric(df['Chloriniteit (mg/l)'], errors='coerce'))
+    if not series_parts:
+        return build_chlorinity_color_config(pd.Series(dtype=float))
+    combined = pd.concat(series_parts, ignore_index=True)
+    return build_chlorinity_color_config(combined)
 
 
 def load_single_csv() -> pd.DataFrame:
     df = pd.read_csv(SINGLE_CSV_PATH, dtype=str, low_memory=False)
-
     if 'Datumtijd' in df.columns:
         df['Datumtijd'] = parse_mixed_datetime(df['Datumtijd'])
     else:
         df['Datumtijd'] = pd.NaT
-
     if 'Datum' in df.columns:
         parsed_datum = parse_mixed_datetime(df['Datum']).dt.normalize()
         df['Datum'] = parsed_datum
@@ -274,7 +273,6 @@ def load_single_csv() -> pd.DataFrame:
         df.loc[mask_missing_dt, 'Datumtijd'] = parsed_datum.loc[mask_missing_dt]
     else:
         df['Datum'] = df['Datumtijd'].dt.normalize()
-
     df['Datum'] = df['Datumtijd'].dt.normalize().fillna(df['Datum'])
     df['Jaar'] = df['Datum'].dt.year
 
@@ -288,21 +286,14 @@ def load_single_csv() -> pd.DataFrame:
     for col in numeric_columns:
         if col in df.columns:
             df[col] = parse_numeric_series(df[col], coordinate=False)
-
     for col in ['x-coordinaat (RD)', 'y-coordinaat (RD)']:
         if col in df.columns:
             df[col] = parse_numeric_series(df[col], coordinate=True)
-
     return df
 
 
 def build_summary_tables(df: pd.DataFrame):
-    """Bouw samenvattingstabellen per meetlocatie voor één meetdag.
-
-    Naast chloriniteit wordt ook de maximaal gemeten diepte meegenomen uit de
-    ruwe data van die dag en locatie. Extra kaarttype 'Max-min' toont het
-    verschil tussen de maximale en minimale chloriniteit per meetlocatie.
-    """
+    """Bouw samenvattingstabellen per meetlocatie voor één meetdag."""
     agg_meta = {
         'x-coordinaat (RD)': 'mean',
         'y-coordinaat (RD)': 'mean',
@@ -316,6 +307,7 @@ def build_summary_tables(df: pd.DataFrame):
     for coord_col in ['x-coordinaat (RD)', 'y-coordinaat (RD)']:
         if coord_col in df_meta.columns:
             df_meta[coord_col] = normalize_rd_coordinate_series(df_meta[coord_col])
+
     df_stats = (
         df.groupby('sheet', dropna=True)['Chloriniteit (mg/l)']
         .agg(['mean', 'min', 'max'])
@@ -406,8 +398,12 @@ def add_labels_and_hover(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left'):
-    color_scale, range_color, colorbar_ticks = build_chlorinity_color_config(df['Chloriniteit (mg/l)'])
+def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left', color_config=None):
+    if color_config is None:
+        color_scale, range_color, colorbar_ticks = build_chlorinity_color_config(df['Chloriniteit (mg/l)'])
+    else:
+        color_scale, range_color, colorbar_ticks = color_config
+
     waarde_label = 'Chloriniteit'
     if 'waarde_label' in df.columns and not df['waarde_label'].dropna().empty:
         waarde_label = str(df['waarde_label'].dropna().iloc[0])
@@ -481,7 +477,6 @@ def build_plot_dataframe(df_day: pd.DataFrame, samenvatting_type: str) -> pd.Dat
     """Bouw de plotdata voor één geselecteerde meetdag en kaarttype."""
     if df_day.empty:
         return pd.DataFrame()
-
     df_gemiddeld, df_minimaal, df_maximaal, df_max_min = build_summary_tables(df_day)
     if samenvatting_type == 'Gemiddelde':
         df_plot = df_gemiddeld
@@ -491,14 +486,11 @@ def build_plot_dataframe(df_day: pd.DataFrame, samenvatting_type: str) -> pd.Dat
         df_plot = df_maximaal
     else:
         df_plot = df_max_min
-
     if df_plot.empty:
         return pd.DataFrame()
-
     df_plot = add_coordinates(df_plot)
     if df_plot.empty:
         return pd.DataFrame()
-
     return add_labels_and_hover(df_plot)
 
 
@@ -522,6 +514,7 @@ gekozen_jaar = st.selectbox(
 )
 
 df_jaar = df[df['Jaar'] == gekozen_jaar].copy()
+
 datums = sorted(df_jaar['Datum'].dropna().unique())
 if not datums:
     st.warning('Geen geldige meetdatums gevonden voor het geselecteerde jaar.')
@@ -543,7 +536,6 @@ with left_col:
     gekozen_datum_links = st.selectbox(
         'Kies oudere meetdatum',
         left_options,
-        index=left_options.index(st.session_state[left_state_key]),
         format_func=format_date_option,
         key=left_state_key,
     )
@@ -572,7 +564,6 @@ with right_col:
     gekozen_datum_rechts = st.selectbox(
         'Kies recentere meetdatum',
         right_options,
-        index=right_options.index(st.session_state[right_state_key]),
         format_func=format_date_option,
         key=right_state_key,
     )
@@ -584,25 +575,41 @@ with right_col:
         key='kaarttype_rechts',
     )
 
+# Bouw eerst beide datasets op, zodat de gedeelde dynamische legenda wordt
+# berekend op basis van chloriniteitwaarden uit beide kaarten samen.
 df_dag_links = df_jaar[df_jaar['Datum'] == gekozen_datum_links].copy()
 df_plot_links = build_plot_dataframe(df_dag_links, samenvatting_type_links)
+
+df_dag_rechts = df_jaar[df_jaar['Datum'] == gekozen_datum_rechts].copy()
+df_plot_rechts = build_plot_dataframe(df_dag_rechts, samenvatting_type_rechts)
+
+shared_color_config = build_shared_chlorinity_color_settings(df_plot_links, df_plot_rechts)
+
 if df_plot_links.empty:
     with left_col:
         st.warning('Geen samenvattingsdata of geldige kaartcoördinaten beschikbaar voor de linker selectie.')
 else:
     titel_links = f'{samenvatting_type_links} Chloride waarden - {format_date_option(gekozen_datum_links)}'
-    fig_links = create_map(df_plot_links, titel_links, colorbar_side='left')
+    fig_links = create_map(
+        df_plot_links,
+        titel_links,
+        colorbar_side='left',
+        color_config=shared_color_config,
+    )
     with left_col:
         st.plotly_chart(fig_links, width='stretch')
 
-df_dag_rechts = df_jaar[df_jaar['Datum'] == gekozen_datum_rechts].copy()
-df_plot_rechts = build_plot_dataframe(df_dag_rechts, samenvatting_type_rechts)
 if df_plot_rechts.empty:
     with right_col:
         st.warning('Geen samenvattingsdata of geldige kaartcoördinaten beschikbaar voor de rechter selectie.')
 else:
     titel_rechts = f'{samenvatting_type_rechts} Chloride waarden - {format_date_option(gekozen_datum_rechts)}'
-    fig_rechts = create_map(df_plot_rechts, titel_rechts, colorbar_side='right')
+    fig_rechts = create_map(
+        df_plot_rechts,
+        titel_rechts,
+        colorbar_side='right',
+        color_config=shared_color_config,
+    )
     with right_col:
         st.plotly_chart(fig_rechts, width='stretch')
 

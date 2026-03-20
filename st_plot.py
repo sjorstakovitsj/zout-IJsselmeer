@@ -53,26 +53,48 @@ def parse_mixed_datetime(values):
 
 
 def normalize_rd_coordinate_value(value):
-    """Normaliseer RD-coördinaten.
+    """Normaliseer RD-coördinaten consequent naar 6 cijfers waar mogelijk.
 
     Regels:
-    - als de waarde alleen uit cijfers bestaat en langer is dan 6 cijfers,
-      neem de eerste 6 cijfers;
-    - behoud waarden met scheidingstekens (punt/komma) voor normale numerieke parsing.
+    - verwijder spaties en scheidingstekens;
+    - gebruik alleen de cijfers uit de invoer;
+    - neem bij 6 of meer cijfers altijd de eerste 6 cijfers;
+    - behoud kortere numerieke waarden om onnodig dataverlies te voorkomen.
     """
     if pd.isna(value):
-        return value
+        return pd.NA
     text = str(value).strip()
     if text == '':
         return pd.NA
-    if re.fullmatch(r'\d{7,}', text):
-        text = text[:6]
-    return text
+    digits = re.sub(r'\D', '', text)
+    if digits == '':
+        return pd.NA
+    if len(digits) >= 6:
+        return digits[:6]
+    return digits
+
+
+def normalize_rd_coordinate_numeric(value):
+    """Normaliseer een numerieke RD-coördinaat (ook na aggregatie) naar 6 cijfers."""
+    if pd.isna(value):
+        return pd.NA
+    try:
+        integer_text = str(int(float(value)))
+    except Exception:
+        return pd.NA
+    normalized = normalize_rd_coordinate_value(integer_text)
+    return pd.to_numeric(normalized, errors='coerce')
+
+
+def normalize_rd_coordinate_series(series):
+    """Normaliseer een serie RD-coördinaten naar 6-cijferige numerieke waarden."""
+    return pd.to_numeric(series.apply(normalize_rd_coordinate_numeric), errors='coerce')
 
 
 def parse_numeric_series(series, coordinate=False):
     if coordinate:
-        series = series.apply(normalize_rd_coordinate_value)
+        normalized = series.apply(normalize_rd_coordinate_value)
+        return pd.to_numeric(normalized, errors='coerce')
     cleaned = series.astype(str).str.replace(' ', '', regex=False).str.strip()
     comma_no_dot_mask = cleaned.str.contains(',', na=False) & ~cleaned.str.contains('.', na=False)
     cleaned.loc[comma_no_dot_mask] = cleaned.loc[comma_no_dot_mask].str.replace(',', '.', regex=False)
@@ -291,6 +313,9 @@ def build_summary_tables(df: pd.DataFrame):
         agg_meta['filename'] = 'first'
 
     df_meta = df.groupby('sheet', dropna=True).agg(agg_meta).reset_index()
+    for coord_col in ['x-coordinaat (RD)', 'y-coordinaat (RD)']:
+        if coord_col in df_meta.columns:
+            df_meta[coord_col] = normalize_rd_coordinate_series(df_meta[coord_col])
     df_stats = (
         df.groupby('sheet', dropna=True)['Chloriniteit (mg/l)']
         .agg(['mean', 'min', 'max'])
@@ -330,6 +355,9 @@ def build_summary_tables(df: pd.DataFrame):
 
 def add_coordinates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    for coord_col in ['x-coordinaat (RD)', 'y-coordinaat (RD)']:
+        if coord_col in df.columns:
+            df[coord_col] = normalize_rd_coordinate_series(df[coord_col])
     df = df.dropna(subset=['x-coordinaat (RD)', 'y-coordinaat (RD)'])
     if df.empty:
         return df.assign(lon=pd.Series(dtype=float), lat=pd.Series(dtype=float))

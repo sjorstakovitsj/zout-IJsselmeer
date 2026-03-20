@@ -7,7 +7,7 @@ import plotly.express as px
 
 # Excel-bron (blijft ondersteund)
 TARGET_FILE = os.path.join(
-    ".", "data", "metingen", "20260318_X1272_Zoutmetingen_IJsselmeer.xlsx"
+    ".", "data", "metingen", "20260320_X1272_Zoutmetingen_IJsselmeer.xlsx"
 )
 
 # Nieuwe bronmap voor losse CSV-bestanden per meetpunt

@@ -1,25 +1,20 @@
-
 import glob
 import os
 import re
 import pandas as pd
 import plotly.express as px
 
-# Excel-bron (blijft ondersteund)
+# Excel-bron (ondersteunt zowel een specifiek bestand als een directory met Excelbestanden)
 TARGET_FILE = os.path.join(
-    ".", "data", "metingen", "20260323_X1272_Zoutmetingen_IJsselmeer.xlsx"
+    ".", "data", "metingen"
 )
-
 # Nieuwe bronmap voor losse CSV-bestanden per meetpunt
 CSV_INPUT_DIR = os.path.join(".", "data", "metingen", "csv")
-
 # Overzichtssheet overslaan; dit is geen meetsheet
 SKIP_SHEETS = {"IJsselmeer"}
-
 # Bestaande CSV behouden en nieuwe metingen eraan toevoegen
 KEEP_EXISTING_CSV = True
 CSV_PATH = os.path.join("data", "chloridemetingen ijsselmeer.csv")
-
 # Maximale RD-afstand (meters) voor fallback op coördinaten als bestandsnaam niet matcht
 LOCATION_COORD_TOLERANCE = 500
 
@@ -81,13 +76,52 @@ def parse_numeric_series(series):
     )
 
 
+def path_contains_verwerkt(path):
+    """Controleer of een pad in een map 'verwerkt' staat (case-insensitive)."""
+    normalized = os.path.normpath(path)
+    parts = [part.lower() for part in normalized.split(os.sep) if part]
+    return "verwerkt" in parts
+
+
+def list_excel_files(target_path):
+    """Geef alle Excelbronnen terug, behalve bestanden onder een map 'verwerkt'.
+
+    Ondersteunt zowel een expliciet bestandspad als een directory.
+    """
+    if not target_path:
+        return []
+
+    if os.path.isfile(target_path):
+        _, ext = os.path.splitext(target_path)
+        if ext.lower() in {".xlsx", ".xls"} and not path_contains_verwerkt(target_path):
+            return [target_path]
+        return []
+
+    if not os.path.isdir(target_path):
+        return []
+
+    pattern_xlsx = os.path.join(target_path, "**", "*.xlsx")
+    pattern_xls = os.path.join(target_path, "**", "*.xls")
+    files = sorted(
+        set(glob.glob(pattern_xlsx, recursive=True) + glob.glob(pattern_xls, recursive=True))
+    )
+    return [file_path for file_path in files if not path_contains_verwerkt(file_path)]
+
+
+def list_csv_files(csv_dir):
+    """Geef alle losse CSV-bronbestanden terug, behalve onder een map 'verwerkt'."""
+    if not csv_dir or not os.path.isdir(csv_dir):
+        return []
+
+    files = sorted(glob.glob(os.path.join(csv_dir, "**", "*.csv"), recursive=True))
+    return [file_path for file_path in files if not path_contains_verwerkt(file_path)]
+
+
 def safe_sheet_name_from_filename(file_path):
     stem = os.path.splitext(os.path.basename(file_path))[0]
     parts = [p for p in re.split(r"[_\-\s]+", stem) if p]
-
     if parts and re.fullmatch(r"\d{6,8}", parts[0]):
         parts = parts[1:]
-
     skip_tokens = {
         "zout",
         "zoutmetingen",
@@ -121,20 +155,15 @@ def load_location_mapping(csv_dir):
     - rdx
     - rdy
 
-    Ondersteunt meerdere meetdagen (bijv. 260303, 260304, 260305, 260306)
-    zolang er per dag een mappingbestand aanwezig is in of onder CSV_INPUT_DIR.
+    Bestanden onder een map 'verwerkt' worden genegeerd.
     """
-    pattern_xlsx = os.path.join(csv_dir, "**", "*.xlsx")
-    pattern_xls = os.path.join(csv_dir, "**", "*.xls")
-    mapping_files = sorted(set(glob.glob(pattern_xlsx, recursive=True) + glob.glob(pattern_xls, recursive=True)))
-
+    mapping_files = list_excel_files(csv_dir)
     frames = []
     for mapping_file in mapping_files:
         try:
             xls = pd.ExcelFile(mapping_file)
         except Exception:
             continue
-
         for sheet in xls.sheet_names:
             try:
                 df = pd.read_excel(mapping_file, sheet_name=sheet)
@@ -142,31 +171,31 @@ def load_location_mapping(csv_dir):
                 continue
             if df.empty:
                 continue
-
             df.columns = [str(c).strip() for c in df.columns]
             basename_col = find_column(df.columns, ["filebasename", "bestand", "bestandnaam", "filename", "filebase"])
             location_col = find_column(df.columns, ["Locatie", "location", "meetpunt", "naam"])
             x_col = find_column(df.columns, ["rdx", "x_rd", "xcoordinaatrd", "x"])
             y_col = find_column(df.columns, ["rdy", "y_rd", "ycoordinaatrd", "y"])
-
             if basename_col is None or location_col is None:
                 continue
-
             mapping = pd.DataFrame()
-            mapping["filebasename"] = df[basename_col].astype(str).str.strip().str.replace(r"\.[A-Za-z0-9]+$", "", regex=True)
+            mapping["filebasename"] = (
+                df[basename_col]
+                .astype(str)
+                .str.strip()
+                .str.replace(r"\.[A-Za-z0-9]+$", "", regex=True)
+            )
             mapping["Locatie"] = df[location_col].astype(str).str.strip()
             mapping["rdx"] = parse_numeric_series(df[x_col]) if x_col else pd.NA
             mapping["rdy"] = parse_numeric_series(df[y_col]) if y_col else pd.NA
             mapping["mapping_file"] = mapping_file
             mapping["mapping_date_token"] = extract_date_token_from_name(mapping_file)
-            mapping = mapping.dropna(subset=["filebasename", "Locatie"]) 
+            mapping = mapping.dropna(subset=["filebasename", "Locatie"])
             mapping = mapping[mapping["filebasename"] != ""]
             if not mapping.empty:
                 frames.append(mapping)
-
     if not frames:
         return pd.DataFrame(columns=["filebasename", "Locatie", "rdx", "rdy", "mapping_file", "mapping_date_token"])
-
     combined = pd.concat(frames, ignore_index=True)
     combined = combined.drop_duplicates(subset=["filebasename"], keep="last")
     return combined
@@ -176,7 +205,6 @@ def find_location_for_csv(csv_path, x_value, y_value, location_mapping):
     """Leid de locatienaam af uit mappingbestand o.b.v. bestandsnaam, met RD-fallback."""
     if location_mapping is None or location_mapping.empty:
         return None
-
     csv_basename = os.path.splitext(os.path.basename(csv_path))[0]
     date_token = extract_date_token_from_name(csv_path)
 
@@ -201,7 +229,6 @@ def find_location_for_csv(csv_path, x_value, y_value, location_mapping):
     nearest = candidates.sort_values("coord_distance").iloc[0]
     if pd.notna(nearest["coord_distance"]) and float(nearest["coord_distance"]) <= LOCATION_COORD_TOLERANCE:
         return str(nearest["Locatie"]).strip()
-
     return None
 
 
@@ -267,12 +294,12 @@ def extract_data_from_sheet(xlsx, sheet):
                 origin="1899-12-30",
                 errors="coerce",
             )
+
         mask_remaining = data["Datumtijd"].isna()
         if mask_remaining.any():
             data.loc[mask_remaining, "Datumtijd"] = parse_mixed_datetime(
                 data.loc[mask_remaining, "Datum/Tijd UTC"]
             )
-
         data["Datum"] = data["Datumtijd"].dt.normalize()
         data["Tijd (UTC)"] = data["Datumtijd"].dt.strftime("%H:%M:%S")
         data = data.drop(columns=["Datum/Tijd UTC"])
@@ -335,7 +362,6 @@ def read_measurement_csv(csv_path, location_mapping=None):
     data["Datumtijd"] = parse_mixed_datetime(data[datetime_col])
     data["Datum"] = data["Datumtijd"].dt.normalize()
     data["Tijd (UTC)"] = data["Datumtijd"].dt.strftime("%H:%M:%S")
-
     data["x-coordinaat (RD)"] = parse_numeric_series(data[x_col])
     data["y-coordinaat (RD)"] = parse_numeric_series(data[y_col])
 
@@ -347,7 +373,6 @@ def read_measurement_csv(csv_path, location_mapping=None):
     if conductivity_series.dropna().median() > 100:
         conductivity_series = conductivity_series / 100.0
     data["Geleidendheid (mS/cm)"] = conductivity_series
-
     data["Temperatuur (graden Celsius)"] = parse_numeric_series(data[temp_col])
     data["Chloriniteit (mg/l)"] = parse_numeric_series(data[cl_col])
 
@@ -360,7 +385,6 @@ def read_measurement_csv(csv_path, location_mapping=None):
             "y-coordinaat (RD)",
         ]
     )
-
     if data.empty:
         return pd.DataFrame()
 
@@ -416,7 +440,6 @@ def merge_with_existing_csv(df_new):
         df_combined = pd.concat([df_existing, df_new], ignore_index=True, sort=False)
         df_combined = df_combined.drop_duplicates()
         return df_combined
-
     return df_new
 
 
@@ -436,8 +459,24 @@ def collect_from_excel(target_file):
     return df_compleet
 
 
-def collect_from_csv_directory(csv_dir, location_mapping=None):
-    csv_files = sorted(glob.glob(os.path.join(csv_dir, "**", "*.csv"), recursive=True))
+def collect_from_excel_sources(excel_files):
+    frames = []
+    for excel_file in excel_files:
+        try:
+            df_single = collect_from_excel(excel_file)
+        except Exception as exc:
+            print(f"Excel overgeslagen wegens fout ({excel_file}): {exc}")
+            continue
+        if df_single.empty:
+            continue
+        frames.append(df_single)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def collect_from_csv_directory(csv_files, location_mapping=None):
     if not csv_files:
         return pd.DataFrame()
 
@@ -460,23 +499,25 @@ def collect_from_csv_directory(csv_dir, location_mapping=None):
 def build_measurement_csv():
     sources_found = False
     frames = []
+
+    excel_files = list_excel_files(TARGET_FILE)
+    csv_files = list_csv_files(CSV_INPUT_DIR)
     location_mapping = load_location_mapping(CSV_INPUT_DIR) if os.path.isdir(CSV_INPUT_DIR) else pd.DataFrame()
 
-    if os.path.exists(TARGET_FILE):
+    if excel_files:
         sources_found = True
-        frames.append(collect_from_excel(TARGET_FILE))
+        frames.append(collect_from_excel_sources(excel_files))
 
-    if os.path.isdir(CSV_INPUT_DIR):
-        csv_files = glob.glob(os.path.join(CSV_INPUT_DIR, "**", "*.csv"), recursive=True)
-        if csv_files:
-            sources_found = True
-            frames.append(collect_from_csv_directory(CSV_INPUT_DIR, location_mapping=location_mapping))
+    if csv_files:
+        sources_found = True
+        frames.append(collect_from_csv_directory(csv_files, location_mapping=location_mapping))
 
     if not sources_found:
         raise FileNotFoundError(
-            f"Geen invoerbestanden gevonden. Verwacht Excel: {TARGET_FILE} of CSV-map: {CSV_INPUT_DIR}"
+            f"Geen invoerbestanden gevonden. Verwacht Excel onder: {TARGET_FILE} of CSV-map: {CSV_INPUT_DIR}"
         )
 
+    frames = [frame for frame in frames if not frame.empty]
     if not frames:
         raise ValueError("Er is geen meetdata ingelezen uit de gevonden bronbestanden.")
 
@@ -512,6 +553,35 @@ def build_measurement_csv():
     print(f"Aantal rijen in CSV: {len(df_output)}")
 
 
+def get_visualisation_source_df(df):
+    """Bepaal de brondata voor 2D-visualisaties.
+
+    Regels:
+    - Als er Excelbestanden gevonden zijn onder TARGET_FILE, gebruik dan alleen
+      rijen uit die Excelbestanden.
+    - Zo niet, gebruik de volledige samengestelde CSV zoals voorheen.
+    - Bestanden onder een map 'verwerkt' zijn al uitgesloten bij het verzamelen.
+    """
+    excel_files = list_excel_files(TARGET_FILE)
+    if not excel_files or "filename" not in df.columns:
+        return df
+
+    excel_basenames = {os.path.basename(path) for path in excel_files}
+    df_excel_only = df[df["filename"].astype(str).isin(excel_basenames)].copy()
+    if df_excel_only.empty:
+        print(
+            "Excelbron gevonden, maar geen overeenkomstige Excel-rijen in de samengestelde CSV. "
+            "Val terug op volledige dataset voor visualisaties."
+        )
+        return df
+
+    print(
+        f"Excelbron gevonden ({len(excel_basenames)} bestand(en)); "
+        "2D-visualisaties worden alleen op basis van Exceldata gemaakt."
+    )
+    return df_excel_only
+
+
 def create_visualisations():
     if not os.path.exists(CSV_PATH):
         print(f"Geen CSV gevonden voor visualisaties: {CSV_PATH}")
@@ -524,6 +594,11 @@ def create_visualisations():
 
     df["Datum"] = parse_mixed_datetime(df["Datum"])
     df["Datumtijd"] = parse_mixed_datetime(df["Datumtijd"])
+    df = get_visualisation_source_df(df)
+    if df.empty:
+        print("Geen data beschikbaar voor visualisaties na bronfiltering.")
+        return
+
     locations = df["sheet"].dropna().unique()
     folder_path = os.path.join("data", "2d visualisaties")
     os.makedirs(folder_path, exist_ok=True)

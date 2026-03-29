@@ -1,5 +1,5 @@
-pyproj
+pyproj>=3.7.2
 streamlit>=1.55.0
-plotly>=5.0
-pandas>=2.0
+plotly>=6.6.0
+pandas>=3.0.1
 

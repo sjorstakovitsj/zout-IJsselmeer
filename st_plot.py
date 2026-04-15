@@ -445,7 +445,7 @@ def create_map(df: pd.DataFrame, title: str, colorbar_side: str = 'left', color_
         range_color=range_color,
         zoom=8,
         center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
-        map_style='white-bg',
+        map_style='open-street-map',
         title=title,
         labels={'Chloriniteit (mg/l)': colorbar_title},
     )

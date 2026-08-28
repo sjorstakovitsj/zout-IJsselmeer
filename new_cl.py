@@ -11,12 +11,31 @@ TARGET_FILE = os.path.join(
 # Nieuwe bronmap voor losse CSV-bestanden per meetpunt
 CSV_INPUT_DIR = os.path.join(".", "data", "metingen", "csv")
 # Overzichtssheet overslaan; dit is geen meetsheet
-SKIP_SHEETS = {"IJsselmeer"}
+SKIP_SHEETS = {"IJsselmeer", "Overzicht_Metingen", "QC", "Detectie", "Instellingen"}
 # Bestaande CSV behouden en nieuwe metingen eraan toevoegen
 KEEP_EXISTING_CSV = True
 CSV_PATH = os.path.join("data", "chloridemetingen ijsselmeer.csv")
 # Maximale RD-afstand (meters) voor fallback op coördinaten als bestandsnaam niet matcht
 LOCATION_COORD_TOLERANCE = 500
+
+# Labels uit het voorblad/overzicht die geen meetmetadata zijn en daarom
+# nooit als kolom of losse rij in de uitvoer-CSV mogen terechtkomen.
+UNWANTED_OVERVIEW_LABELS = {
+    "Zoutmetingen IGL bv i.o.v. Rijkswaterstaat Centrale Informatievoorziening",
+    "Meetpunt",
+    "Ronde",
+    "Datum_x",
+    "Starttijd (UTC+1)",
+    "x voorgeschreven (RD)",
+    "y voorgeschreven (RD)",
+    "x werkelijk (RD)",
+    "y werkelijk (RD)",
+    "Datum_y",
+}
+UNWANTED_OVERVIEW_KEYS = {
+    re.sub(r"[^a-z0-9]+", "", label.strip().lower())
+    for label in UNWANTED_OVERVIEW_LABELS
+}
 
 
 def format_dutch_date(value):
@@ -232,84 +251,142 @@ def find_location_for_csv(csv_path, x_value, y_value, location_mapping):
     return None
 
 
-def extract_data_from_sheet(xlsx, sheet):
-    # Extract info of measurement
-    info = pd.read_excel(xlsx, sheet_name=sheet, usecols="A:B", nrows=9)
-    info = info.drop([4, 5], errors="ignore")
-    info.columns = ["Parameter", "Waarde"]
-    info.index = info["Parameter"]
-    info = info.drop("Parameter", axis=1)
-    info = info.transpose()
+def find_measurement_header_row(xlsx, sheet):
+    """Zoek de Excelrij waarop de meettabel begint."""
 
-    # Extract observations
-    # Ondersteunt twee formaten:
-    # 1) 6 kolommen: aparte kolommen voor Datum en Tijd (UTC)
-    # 2) 5 kolommen: gecombineerde kolom 'Datum/Tijd UTC' en geen header voor diepte
-    data = pd.read_excel(xlsx, sheet_name=sheet, header=10)
-    data = data.drop(0, errors="ignore")
-    data = data.dropna(how="all")
+    preview = pd.read_excel(
+        xlsx,
+        sheet_name=sheet,
+        header=None,
+        nrows=25,
+    )
 
-    if len(data.columns) == 6:
-        data.columns = [
-            "Diepte (m)",
-            "Temperatuur (graden Celsius)",
-            "Geleidendheid (mS/cm)",
-            "Chloriniteit (mg/l)",
-            "Datum",
-            "Tijd (UTC)",
-        ]
-        data = data.dropna(
-            subset=["Diepte (m)", "Chloriniteit (mg/l)", "Datum", "Tijd (UTC)"]
-        )
-        df = pd.merge(info, data, how="cross")
-        df["Datum"] = parse_mixed_datetime(df["Datum"]).dt.normalize()
-        tijd_as_str = df["Tijd (UTC)"].astype(str).str.strip()
-        tijd_as_str = tijd_as_str.str.replace(" UTC", "", regex=False)
-        df["Timedelta"] = pd.to_timedelta(tijd_as_str, errors="coerce")
-        df["Datumtijd"] = df["Datum"] + df["Timedelta"]
-        df = df.drop("Timedelta", axis=1)
-        return df
+    expected_terms = {
+        "diepte",
+        "temperatuur",
+        "geleidendheid",
+        "chloriniteit",
+        "datum",
+        "tijd",
+    }
 
-    if len(data.columns) == 5:
-        data.columns = [
-            "Diepte (m)",
-            "Temperatuur (graden Celsius)",
-            "Geleidendheid (mS/cm)",
-            "Chloriniteit (mg/l)",
-            "Datum/Tijd UTC",
-        ]
-        data = data.dropna(
-            subset=["Diepte (m)", "Chloriniteit (mg/l)", "Datum/Tijd UTC"]
-        )
+    for row_index, row in preview.iterrows():
+        values = {
+            str(value).strip().lower()
+            for value in row.dropna()
+        }
 
-        # In dit bronbestand staat Datum/Tijd UTC vaak als Excel-datumgetal.
-        # Converteer eerst numerieke waarden, daarna eventueel tekstuele waarden.
-        data["Datumtijd"] = pd.NaT
-        numeric_dt = pd.to_numeric(data["Datum/Tijd UTC"], errors="coerce")
-        mask_numeric = numeric_dt.notna()
-        if mask_numeric.any():
-            data.loc[mask_numeric, "Datumtijd"] = pd.to_datetime(
-                numeric_dt[mask_numeric],
-                unit="D",
-                origin="1899-12-30",
-                errors="coerce",
-            )
+        matches = 0
 
-        mask_remaining = data["Datumtijd"].isna()
-        if mask_remaining.any():
-            data.loc[mask_remaining, "Datumtijd"] = parse_mixed_datetime(
-                data.loc[mask_remaining, "Datum/Tijd UTC"]
-            )
-        data["Datum"] = data["Datumtijd"].dt.normalize()
-        data["Tijd (UTC)"] = data["Datumtijd"].dt.strftime("%H:%M:%S")
-        data = data.drop(columns=["Datum/Tijd UTC"])
-        df = pd.merge(info, data, how="cross")
-        return df
+        for term in expected_terms:
+            if any(term in value for value in values):
+                matches += 1
+
+        # Minimaal drie bekende meetkolommen op dezelfde rij
+        if matches >= 3:
+            return row_index
 
     raise ValueError(
-        f"Sheet '{sheet}' heeft een onverwacht aantal kolommen: {len(data.columns)}. "
-        f"Ingelezen kolommen: {list(data.columns)}"
+        f"Geen herkenbare kopregel voor meetgegevens gevonden "
+        f"in sheet '{sheet}'."
     )
+
+def extract_data_from_sheet(xlsx, sheet):
+    """Lees een profielsheet en zet deze om naar het vaste uitvoerformaat."""
+    header_row = find_measurement_header_row(xlsx, sheet)
+
+    # Metadata zijn de parameter/waarde-paren boven de meettabel.
+    meta_raw = pd.read_excel(
+        xlsx, sheet_name=sheet, header=None, usecols="A:B", nrows=header_row
+    )
+    metadata = {}
+    for parameter, value in meta_raw.itertuples(index=False, name=None):
+        if pd.isna(parameter):
+            continue
+        key = normalize_column_name(parameter)
+        if not key or key.startswith("zoutmetingen"):
+            continue
+        metadata[key] = value
+
+    # Gebruik de werkelijk gevonden header, niet een vast rijnummer.
+    data = pd.read_excel(xlsx, sheet_name=sheet, header=header_row)
+    data = data.dropna(how="all").dropna(axis=1, how="all")
+
+    depth_col = find_column(data.columns, ["Diepte", "Diepte (m)", "depth"])
+    temp_col = find_column(data.columns, ["Temperatuur", "Temperatuur (graden Celsius)", "temperature"])
+    cond_col = find_column(data.columns, ["Geleidendheid", "Geleidendheid (mS/cm)", "conductivity", "ec"])
+    cl_col = find_column(data.columns, ["Chloriniteit", "Chloriniteit (mg/l)", "chloride", "cl"])
+    dt_col = find_column(data.columns, ["Datum/Tijd UTC+1", "Datum/Tijd UTC", "Datumtijd", "datetime", "timestamp"])
+    date_col = find_column(data.columns, ["Datum"])
+    time_col = find_column(data.columns, ["Tijd (UTC)", "Tijd (UTC+1)", "Tijd"])
+
+    required = {"diepte": depth_col, "temperatuur": temp_col, "geleidendheid": cond_col, "chloriniteit": cl_col}
+    missing = [name for name, column in required.items() if column is None]
+    if missing or (dt_col is None and (date_col is None or time_col is None)):
+        raise ValueError(
+            f"Sheet '{sheet}' mist verplichte meetkolommen: {missing}. "
+            f"Ingelezen kolommen: {list(data.columns)}"
+        )
+
+    output = pd.DataFrame(index=data.index)
+    output["Diepte (m)"] = parse_numeric_series(data[depth_col])
+    output["Temperatuur (graden Celsius)"] = parse_numeric_series(data[temp_col])
+    output["Geleidendheid (mS/cm)"] = parse_numeric_series(data[cond_col])
+    output["Chloriniteit (mg/l)"] = parse_numeric_series(data[cl_col])
+
+    if dt_col is not None:
+        raw_dt = data[dt_col]
+        numeric_dt = pd.to_numeric(raw_dt, errors="coerce")
+        output["Datumtijd"] = pd.NaT
+        numeric_mask = numeric_dt.notna()
+        if numeric_mask.any():
+            output.loc[numeric_mask, "Datumtijd"] = pd.to_datetime(
+                numeric_dt[numeric_mask], unit="D", origin="1899-12-30", errors="coerce"
+            )
+        text_mask = output["Datumtijd"].isna()
+        if text_mask.any():
+            output.loc[text_mask, "Datumtijd"] = parse_mixed_datetime(raw_dt.loc[text_mask])
+    else:
+        dates = parse_mixed_datetime(data[date_col]).dt.normalize()
+        times = pd.to_timedelta(
+            data[time_col].astype(str).str.replace(" UTC", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+        output["Datumtijd"] = dates + times
+
+    # De eenhedenregel heeft geen numerieke diepte/chloriniteit en geen datumtijd.
+    output = output.dropna(subset=["Diepte (m)", "Chloriniteit (mg/l)", "Datumtijd"])
+    if output.empty:
+        return output
+
+    output["Datum"] = output["Datumtijd"].dt.normalize()
+    output["Tijd (UTC)"] = output["Datumtijd"].dt.strftime("%H:%M:%S")
+
+    meetpunt = metadata.get("meetpunt")
+    ronde = metadata.get("ronde")
+    profiel_id = metadata.get("id")
+    locatie = metadata.get("locatie")
+    x_actual = metadata.get("xwerkelijkrd")
+    y_actual = metadata.get("ywerkelijkrd")
+    x_prescribed = metadata.get("xvoorgeschrevenrd")
+    y_prescribed = metadata.get("yvoorgeschrevenrd")
+
+    output["GPS-Mark"] = profiel_id
+    output["ID"] = profiel_id
+    output["Locatie"] = locatie
+    # In nieuwe bestanden is Ronde leeg; Meetpunt bevat de profielnaam.
+    output["Rondnr"] = ronde if pd.notna(ronde) else meetpunt
+    output["x-coordinaat (RD)"] = x_actual if pd.notna(x_actual) else x_prescribed
+    output["y-coordinaat (RD)"] = y_actual if pd.notna(y_actual) else y_prescribed
+    output["Maximale diepte [m]"] = output["Diepte (m)"].max()
+
+    column_order = [
+        "GPS-Mark", "ID", "Locatie", "Rondnr", "x-coordinaat (RD)",
+        "y-coordinaat (RD)", "Maximale diepte [m]", "Diepte (m)",
+        "Temperatuur (graden Celsius)", "Geleidendheid (mS/cm)",
+        "Chloriniteit (mg/l)", "Datumtijd", "Datum", "Tijd (UTC)"
+    ]
+    return output[column_order]
 
 
 def read_measurement_csv(csv_path, location_mapping=None):
@@ -425,7 +502,7 @@ def merge_with_existing_csv(df_new):
             df_new[col] = parse_mixed_datetime(df_new[col])
 
     if KEEP_EXISTING_CSV and os.path.exists(CSV_PATH):
-        df_existing = pd.read_csv(CSV_PATH)
+        df_existing = pd.read_csv(CSV_PATH, dtype=str, low_memory=False)
         for col in ["Datum", "Datumtijd"]:
             if col in df_existing.columns:
                 df_existing[col] = parse_mixed_datetime(df_existing[col])
@@ -443,19 +520,96 @@ def merge_with_existing_csv(df_new):
     return df_new
 
 
+
+def load_excel_overview_mapping(xlsx):
+    """Lees Overzicht_Metingen als aanvullende controle/mapping."""
+    if "Overzicht_Metingen" not in xlsx.sheet_names:
+        return pd.DataFrame()
+    overview = pd.read_excel(xlsx, sheet_name="Overzicht_Metingen")
+    overview = overview.dropna(how="all")
+    if overview.empty:
+        return overview
+    overview.columns = [str(column).strip() for column in overview.columns]
+    return overview
+
+
+def enrich_excel_measurements(df, sheet, overview_mapping):
+    """Vul alleen werkelijk ontbrekende profielvelden aan uit Overzicht_Metingen."""
+    result = df.copy()
+    if overview_mapping is None or overview_mapping.empty:
+        return result
+
+    id_match = re.match(r"^(\d+)_", str(sheet))
+    if not id_match:
+        return result
+    profile_id = int(id_match.group(1))
+    id_col = find_column(overview_mapping.columns, ["ID"])
+    if id_col is None:
+        return result
+    ids = pd.to_numeric(overview_mapping[id_col], errors="coerce")
+    selected = overview_mapping.loc[ids.eq(profile_id)]
+    if selected.empty:
+        return result
+    record = selected.iloc[0]
+
+    source_map = {
+        "ID": ["ID"],
+        "Locatie": ["Locatie"],
+        "Rondnr": ["Ronde", "Meetpunt"],
+        "x-coordinaat (RD)": ["X werkelijk (m)", "X voorgeschreven (m)"],
+        "y-coordinaat (RD)": ["Y werkelijk (m)", "Y voorgeschreven (m)"],
+        "Maximale diepte [m]": ["Maximale diepte (m)"],
+    }
+    for target, candidates in source_map.items():
+        value = pd.NA
+        for candidate in candidates:
+            source = find_column(overview_mapping.columns, [candidate])
+            if source is not None and pd.notna(record[source]):
+                value = record[source]
+                break
+        if pd.notna(value):
+            if target not in result.columns:
+                result[target] = value
+            else:
+                result[target] = result[target].fillna(value)
+
+    if "ID" in result.columns:
+        result["GPS-Mark"] = result.get("GPS-Mark", pd.Series(index=result.index, dtype=object)).fillna(result["ID"])
+    return result
+
+
 def collect_from_excel(target_file):
     df_compleet = pd.DataFrame()
+
     with pd.ExcelFile(target_file) as xlsx:
+        overview_mapping = load_excel_overview_mapping(xlsx)
         for sheet in sorted(xlsx.sheet_names):
             if sheet in SKIP_SHEETS:
-                print(f"Sheet overgeslagen: {sheet}")
+                print(f"Sheet overgeslagen volgens SKIP_SHEETS: {sheet}")
                 continue
-            df_single = extract_data_from_sheet(xlsx, sheet)
+
+            try:
+                df_single = extract_data_from_sheet(xlsx, sheet)
+            except Exception as exc:
+                print(
+                    f"Sheet '{sheet}' overgeslagen wegens onverwachte "
+                    f"indeling: {exc}"
+                )
+                continue
+
             if df_single.empty:
+                print(f"Sheet '{sheet}' bevat geen bruikbare meetdata.")
                 continue
+
+            df_single = enrich_excel_measurements(df_single, sheet, overview_mapping)
             df_single["sheet"] = sheet
             df_single["filename"] = os.path.basename(target_file)
-            df_compleet = pd.concat([df_compleet, df_single], ignore_index=True)
+
+            df_compleet = pd.concat(
+                [df_compleet, df_single],
+                ignore_index=True
+            )
+
     return df_compleet
 
 
@@ -496,6 +650,40 @@ def collect_from_csv_directory(csv_files, location_mapping=None):
     return pd.concat(frames, ignore_index=True)
 
 
+def remove_overview_artifacts(df):
+    """Verwijder voorbladlabels die per ongeluk als kolom of losse rij zijn ingelezen."""
+    if df.empty:
+        return df
+
+    result = df.copy()
+
+    # Verwijder ongewenste kolommen, ook bij kleine verschillen in hoofdletters
+    # en leestekens.
+    columns_to_drop = [
+        column
+        for column in result.columns
+        if normalize_column_name(column) in UNWANTED_OVERVIEW_KEYS
+    ]
+    if columns_to_drop:
+        result = result.drop(columns=columns_to_drop)
+        print(f"Overzichtskolommen verwijderd: {columns_to_drop}")
+
+    # Extra vangnet voor losse overzichtsregels: verwijder alleen zeer lege
+    # regels waarin een van de bekende labels als celwaarde voorkomt.
+    non_empty_count = result.notna().sum(axis=1)
+    overview_row_mask = pd.Series(False, index=result.index)
+    for column in result.columns:
+        cell_keys = result[column].astype("string").fillna("").map(normalize_column_name)
+        overview_row_mask |= cell_keys.isin(UNWANTED_OVERVIEW_KEYS)
+    overview_row_mask &= non_empty_count <= 2
+
+    if overview_row_mask.any():
+        print(f"Losse overzichtsregels verwijderd: {int(overview_row_mask.sum())}")
+        result = result.loc[~overview_row_mask].copy()
+
+    return result
+
+
 def build_measurement_csv():
     sources_found = False
     frames = []
@@ -522,19 +710,20 @@ def build_measurement_csv():
         raise ValueError("Er is geen meetdata ingelezen uit de gevonden bronbestanden.")
 
     df_compleet = pd.concat(frames, ignore_index=True, sort=False)
+    df_compleet = remove_overview_artifacts(df_compleet)
 
-    rename_dict = {
-        "15_MG": "MG_15",
-        "16_MG": "MG_16",
-        "17_MG": "MG_17",
-        "18_MG": "MG_18",
-        "19_MG": "MG_19",
-        "VG_DO_14,25": "VG_DO_14.25",
-    }
-    if "sheet" in df_compleet.columns:
-        df_compleet = df_compleet.replace({"sheet": rename_dict})
-    if "Rondnr" in df_compleet.columns:
-        df_compleet = df_compleet.replace({"Rondnr": rename_dict})
+    #rename_dict = {
+    #    "15_MG": "MG_15",
+    #    "16_MG": "MG_16",
+    #    "17_MG": "MG_17",
+    #    "18_MG": "MG_18",
+    #    "19_MG": "MG_19",
+    #    "VG_DO_14,25": "VG_DO_14.25",
+    #}
+    #if "sheet" in df_compleet.columns:
+    #    df_compleet = df_compleet.replace({"sheet": rename_dict})
+    #if "Rondnr" in df_compleet.columns:
+    #    df_compleet = df_compleet.replace({"Rondnr": rename_dict})
 
     # Historische correctie uit bestaand script behouden
     if {"x-coordinaat (RD)", "sheet"}.issubset(df_compleet.columns):
@@ -547,6 +736,7 @@ def build_measurement_csv():
 
     # Bestaande CSV behouden en nieuwe data erbij zetten
     df_output = merge_with_existing_csv(df_compleet)
+    df_output = remove_overview_artifacts(df_output)
     ensure_parent_dir(CSV_PATH)
     df_output.to_csv(CSV_PATH, index=False)
     print(f"CSV bijgewerkt: {CSV_PATH}")
@@ -587,7 +777,7 @@ def create_visualisations():
         print(f"Geen CSV gevonden voor visualisaties: {CSV_PATH}")
         return
 
-    df = pd.read_csv(CSV_PATH)
+    df = pd.read_csv(CSV_PATH, dtype=str, low_memory=False)
     if df.empty or "sheet" not in df.columns:
         print("Geen data beschikbaar voor visualisaties.")
         return

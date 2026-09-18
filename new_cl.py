@@ -405,6 +405,10 @@ def read_measurement_csv(csv_path, location_mapping=None):
     if data.empty:
         return pd.DataFrame()
 
+    location_col = find_column(
+        data.columns,
+        ["locatie", "location", "locatiecode", "location_code", "meetpunt"],
+    )
     datetime_col = find_column(data.columns, ["datetime", "datumtijd", "timestamp", "date_time"])
     x_col = find_column(data.columns, ["rdx", "x_rd", "xcoordinaatrd", "x", "xcoordinaat"])
     y_col = find_column(data.columns, ["rdy", "y_rd", "ycoordinaatrd", "y", "ycoordinaat"])
@@ -465,11 +469,6 @@ def read_measurement_csv(csv_path, location_mapping=None):
     if data.empty:
         return pd.DataFrame()
 
-    representative_x = data["x-coordinaat (RD)"].dropna().median()
-    representative_y = data["y-coordinaat (RD)"].dropna().median()
-    mapped_location = find_location_for_csv(csv_path, representative_x, representative_y, location_mapping)
-    sheet_name = mapped_location or safe_sheet_name_from_filename(csv_path)
-
     output = data[
         [
             "x-coordinaat (RD)",
@@ -483,9 +482,51 @@ def read_measurement_csv(csv_path, location_mapping=None):
             "Datumtijd",
         ]
     ].copy()
-    output["Locatie"] = pd.NA
-    output["Rondnr"] = sheet_name
-    output["sheet"] = sheet_name
+
+    # Gebruik de locatie(code) uit de CSV als primaire bron. Dit ondersteunt
+    # zowel bestanden per meetpunt als verzamelbestanden met meerdere locaties.
+    if location_col is not None:
+        source_location = data.loc[output.index, location_col].astype("string").str.strip()
+        source_location = source_location.mask(
+            source_location.str.lower().isin(["", "-", "nan", "none", "<na>"])
+        )
+    else:
+        source_location = pd.Series(pd.NA, index=output.index, dtype="string")
+
+    output["Locatie"] = source_location
+
+    # Behoud de bestaande mappingfunctionaliteit als fallback voor rijen zonder
+    # bruikbare locatie in de CSV. Match eerst op bestandsnaam en daarna per rij
+    # op de dichtstbijzijnde RD-coordinaten.
+    missing_location = output["Locatie"].isna()
+    if missing_location.any():
+        csv_basename = os.path.splitext(os.path.basename(csv_path))[0]
+        mapped_by_filename = None
+        if location_mapping is not None and not location_mapping.empty:
+            exact = location_mapping[
+                location_mapping["filebasename"].astype(str) == csv_basename
+            ]
+            if not exact.empty:
+                mapped_by_filename = str(exact.iloc[0]["Locatie"]).strip()
+
+        if mapped_by_filename:
+            output.loc[missing_location, "Locatie"] = mapped_by_filename
+        else:
+            for row_index in output.index[missing_location]:
+                mapped_location = find_location_for_csv(
+                    csv_path,
+                    output.at[row_index, "x-coordinaat (RD)"],
+                    output.at[row_index, "y-coordinaat (RD)"],
+                    location_mapping,
+                )
+                if mapped_location:
+                    output.at[row_index, "Locatie"] = mapped_location
+
+    # Laatste fallback blijft de bestaande afleiding uit de bestandsnaam.
+    fallback_name = safe_sheet_name_from_filename(csv_path)
+    output["Locatie"] = output["Locatie"].fillna(fallback_name)
+    output["Rondnr"] = output["Locatie"]
+    output["sheet"] = output["Locatie"]
     output["filename"] = os.path.basename(csv_path)
     return output
 
